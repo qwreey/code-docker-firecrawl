@@ -58,7 +58,8 @@
 services:
   firecrawl:
     build:
-      context: ..
+      # Relative to this file, i.e. this repo's root, wherever ootb cloned it.
+      context: .
     container_name: "${PREFIX:-}code-docker-firecrawl"
     restart: unless-stopped
     cap_drop: [ALL]

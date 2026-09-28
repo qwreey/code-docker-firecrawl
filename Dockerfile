@@ -157,6 +157,27 @@ RUN node -e ' \
     console.log("patched extract-worker.ts to degrade gracefully without RabbitMQ"); \
   '
 
+# Fourth patch, found the same way (a crawl that never left "scraping" in the stack test):
+# nuq-prefetch-worker's prefetchJobs() claims up to 500 queued jobs - flips them to
+# status 'active' with a fresh lock - and then hands them to RabbitMQ. With no RabbitMQ
+# the hand-off only logs "NuQ sender not started", so those jobs sit locked and
+# undelivered, while the workers' own postgres fallback (getJobToProcess) only ever
+# selects 'queued' rows: every job the prefetcher touched is stranded until its lock
+# expires and the reconciler requeues it - for the prefetcher to grab again. Without
+# RabbitMQ there is nothing to prefetch into, so the worker idles instead (waits
+# forever rather than exiting, since the harness treats any service ending as fatal)
+# and the workers poll postgres directly, which is the path nuq falls back to anyway.
+RUN node -e ' \
+    const fs = require("fs"); \
+    const f = "src/services/worker/nuq-prefetch-worker.ts"; \
+    const before = fs.readFileSync(f, "utf8"); \
+    const needle = "  try {\n    await Promise.all([\n      (async () => {\n        while (true) {\n          await crawlFinishedQueue.prefetchJobs();"; \
+    if (!before.includes(needle)) throw new Error("nuq-prefetch-worker.ts prefetch loop not found verbatim - upstream may have changed this file"); \
+    const replacement = "  if (!config.NUQ_RABBITMQ_URL) {\n    logger.warn(\"NUQ_RABBITMQ_URL is not configured - prefetch worker idles; workers take jobs straight from postgres (see code-docker-firecrawl CLAUDE.md)\");\n    await new Promise(() => {});\n  }\n\n" + needle; \
+    fs.writeFileSync(f, before.replace(needle, replacement)); \
+    console.log("patched nuq-prefetch-worker.ts to idle without RabbitMQ"); \
+  '
+
 RUN rm -rf dist && pnpm run build
 RUN test -s dist/src/harness.js && test -s dist/src/controllers/v0/crawl-status.js
 RUN pnpm prune --prod --ignore-scripts
@@ -280,8 +301,18 @@ COPY --from=netshare / /etc/code-docker-firecrawl/router-client/netshare/
 RUN chmod +x /etc/code-docker-firecrawl/router-client/dns-local/dns-local.sh
 
 # Per-program rotated log dirs, matching supervisord.d/*.conf's stdout_logfile paths.
+# Root-owned, because supervisord (root) is what writes into them, and root here has no
+# CAP_DAC_OVERRIDE (cap_drop: ALL): it can't write into a directory some other user owns.
+# /var/log/redis comes from the redis package as redis:adm 2750, so mkdir -p alone left
+# supervisord unable to create redis's log file - the program went FATAL. For the same
+# reason nginx's packaged logs, www-data-owned files it opens as root before reading any
+# config, are pointed at stdout/stderr instead (plus `-e` in nginx-gate-service.sh).
 RUN mkdir -p /var/log/postgres /var/log/redis /var/log/playwright /var/log/firecrawl \
-      /var/log/nginx-gate /var/log/dns-local
+      /var/log/nginx-gate /var/log/dns-local \
+ && chown root:root /var/log/redis && chmod 0755 /var/log/redis \
+ && sed -i -e 's|^error_log /var/log/nginx/error.log;|error_log /dev/stderr;|' \
+      -e 's|access_log /var/log/nginx/access.log;|access_log /dev/stdout;|' /etc/nginx/nginx.conf \
+ && grep -q '^error_log /dev/stderr;' /etc/nginx/nginx.conf
 
 COPY config/supervisord.conf /etc/code-docker-firecrawl/supervisord.conf
 COPY config/supervisord.d/ /etc/code-docker-firecrawl/supervisord.d/

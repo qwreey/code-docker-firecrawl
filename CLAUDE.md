@@ -103,7 +103,7 @@ contributes only its `nuq.sql` (this image runs postgres directly rather than vi
 app's own Dockerfile, since pg_cron/`shared_preload_libraries` setup happens in
 `postgres-service.sh` instead - see below).
 
-### Three source patches - the one place this repo deviates from "upstream code
+### Four source patches - the one place this repo deviates from "upstream code
 unmodified"
 
 All three are applied to the TypeScript source, before `tsc` compiles it, and all three
@@ -292,6 +292,31 @@ future re-verification isn't surprised twice:
   the actual problem except one easy-to-miss line, and is exactly why the nuq.sql-applied
   marker (see "Postgres: idempotent first-boot init" above) is a *separate* check from
   "does `PG_VERSION` exist" rather than one flag standing in for both steps.
+
+### Found only in the real stack (2026-09-28, after the standalone run above)
+
+The standalone verification ran `docker run` without the overlay's `cap_drop: [ALL]`,
+so these only surfaced once the container ran under code-docker's compose. Each was
+fixed; the list is here so the next change is tested the same way (in the stack, with
+the overlay's own capabilities), not with a bare `docker run`.
+
+- **Postgres crash-looped on its first restart.** The entrypoint did `chown -R` on the
+  data directory every start; after initdb that directory is postgres-owned 0700, and
+  root without `CAP_DAC_READ_SEARCH` can't list it. Now only the directory itself is
+  chowned, and only when root still owns it (a fresh volume); a directory owned by some
+  other uid - another postgres install's data - stops the container with a message
+  instead of being re-owned.
+- **`redis` and `nginx-gate` went FATAL.** Root without `CAP_DAC_OVERRIDE` can't write
+  into another user's directory: `/var/log/redis` ships redis-owned, and nginx opens its
+  packaged, www-data-owned log files before reading any config. The Dockerfile makes
+  `/var/log/redis` root-owned and points nginx's logs at stdout/stderr (`-e` too).
+- **Crawls never finished** - the fourth source patch (see the Dockerfile): without
+  RabbitMQ the prefetch worker claimed queued jobs and then stranded them. It idles now;
+  a 5-page crawl completes in ~26s.
+- **Crawl status does not survive a container restart.** It lives in redis, which runs
+  without persistence here (`Job not found` for a crawl started before the restart).
+  Acceptable for an agent tool whose crawls are short-lived; the scraped data itself is
+  returned in the response, not stored for later.
 
 ## What a person never sees here
 

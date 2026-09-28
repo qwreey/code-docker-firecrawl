@@ -38,4 +38,4 @@ else
 	echo "[nginx-gate] bearer-token gate active on 0.0.0.0:${GATE_PORT}, proxying to 127.0.0.1:${API_PORT}"
 fi
 
-exec nginx -g "daemon off;"
+exec nginx -e /dev/stderr -g "daemon off;"

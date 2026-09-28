@@ -39,9 +39,25 @@ fi
 # runs as the unprivileged `postgres` user (see config/supervisord.d/postgres.conf) and
 # cannot chown it itself. This is the one piece of root-only setup this image needs;
 # CAP_CHOWN is the only capability it costs (see CLAUDE.md's capability accounting).
+#
+# Only the directory itself, and only when postgres doesn't already own it: after the
+# first boot initdb leaves it postgres-owned and mode 0700, and root without
+# CAP_DAC_READ_SEARCH (dropped - cap_drop: ALL) can't even list it, so a recursive
+# chown on every start failed and crash-looped the container on its first restart.
 PGDATA_DIR="${PGDATA:-/data/postgres}"
 mkdir -p "${PGDATA_DIR}"
-chown -R postgres:postgres "${PGDATA_DIR}"
+pg_uid="$(id -u postgres)"
+dir_uid="$(stat -c %u "${PGDATA_DIR}")"
+if [ "$dir_uid" != "$pg_uid" ]; then
+	if [ "$dir_uid" != 0 ]; then
+		# Owned by some other uid: data from a different postgres (e.g. this repo's older
+		# multi-container layout used the official image, uid 999). Re-owning it would
+		# only hand this postgres files it can't necessarily use - say so and stop.
+		echo "entrypoint: ${PGDATA_DIR} belongs to uid $dir_uid, not this image's postgres ($pg_uid) - it holds another postgres install's data. Remove the volume (docker volume rm <prefix>code-docker-firecrawl-postgres-data) to start fresh."
+		exit 1
+	fi
+	chown postgres:postgres "${PGDATA_DIR}"
+fi
 
 # /var/run/postgresql is where postgres puts its Unix socket - also root-owned on a fresh
 # container if it isn't already there from the image layer (it usually is, from the apt
