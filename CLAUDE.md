@@ -59,9 +59,11 @@ container instead of several.
 
 Unchanged from before: Firecrawl's fetchers (the api harness's worker processes and
 playwright-service) exist to fetch **attacker-influenced URLs**, including redirects they
-follow themselves. `code-docker-internal` is not a safe place for that (webmanager on
-`code-docker:81` has no login of its own, router-manager/VNC are reachable from there
-too), and dind's nested containers all share one daemon/bridge with no cheap way to carve
+follow themselves. `code-docker-internal` is not a safe place for that: `dind:2375` is an
+unauthenticated Docker API there, and code-docker's nginx (code-server, webmanager - no
+login by default) answers there too. A private network only isolates because router's
+front door refuses every network but its outward-facing one (router-docker v0.1.1) -
+before that, `http://router/` from this network reached code-server. And dind's nested containers all share one daemon/bridge with no cheap way to carve
 out per-container egress the way code-docker's own `netinit.provider`/`netinit.gateway`
 labels do. So the AIO container still gets its own sibling-level `internal: true` network
 (`firecrawl`), not a construct living inside dind.
