@@ -1,32 +1,17 @@
-# Templated by entrypoint.sh (plain sed substitution of __FIRECRAWL_TOKEN__), only when
-# FIRECRAWL_TOKEN is non-empty - see that script for the empty-token fail-closed branch.
+# Templated by entrypoint.sh (plain sed substitution of __GATE_PORT__).
 #
-# This is the ONLY thing standing between "any container reachable from
-# code-docker-internal" and Firecrawl's API, because Firecrawl's self-host build has no
-# key check of its own (USE_DB_AUTHENTICATION=false, no Supabase wired up). Every request
-# without the exact bearer token gets 401 before nginx even proxies anything.
-#
-# `resolver` + a variable in `proxy_pass`, not a bare hostname literal there - nginx only
-# resolves a literal proxy_pass hostname ONCE, at worker startup, and caches it for that
-# worker's lifetime. firecrawl-api gets a new IP every time it's recreated (an image bump,
-# `docker compose up` picking up a new FIRECRAWL_TAG, ...), which happens independently of
-# firecrawl-front - a bare hostname here would silently 502 with "Connection refused" to a
-# stale IP until firecrawl-front itself happened to restart too (measured live during this
-# repo's own verification: exactly this happened after firecrawl-api was recreated once).
-# Same reasoning as router's own vhost nginx config uses for its upstreams - see
-# code-docker's own CLAUDE.md, "router" section.
+# `resolver` + a variable in `proxy_pass`, not a bare hostname literal - nginx only
+# resolves a literal proxy_pass hostname ONCE, at worker startup, and the AIO container
+# gets a new IP every time it's recreated. Same reasoning as router's own vhost nginx
+# config and this repo's old firecrawl-front - see CLAUDE.md.
 resolver 127.0.0.11 valid=10s;
 
 server {
-    listen 3002;
+    listen __GATE_PORT__;
 
     location / {
-        if ($http_authorization != "Bearer __FIRECRAWL_TOKEN__") {
-            return 401;
-        }
-
-        set $firecrawl_api firecrawl-api;
-        proxy_pass http://$firecrawl_api:3002;
+        set $firecrawl_aio firecrawl;
+        proxy_pass http://$firecrawl_aio:__GATE_PORT__;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header Connection "";
