@@ -1,0 +1,29 @@
+# Templated by nginx-gate-service.sh (plain sed substitution), only when FIRECRAWL_TOKEN
+# is non-empty - see that script for the empty-token fail-closed branch.
+#
+# This is the ONLY thing standing between "anything reachable from code-docker-internal"
+# and Firecrawl's API, because Firecrawl's self-host build has no key check of its own
+# (USE_DB_AUTHENTICATION=false, no Supabase wired up).
+#
+# No `resolver`/variable-in-proxy_pass trick here, unlike the old multi-container
+# firecrawl-front: that existed because firecrawl-api was a separate container that could
+# be recreated with a new IP independently of the proxy. Here the upstream is this same
+# container's own loopback address - it never changes without this container itself
+# restarting, which restarts nginx too.
+server {
+    listen __GATE_PORT__;
+
+    location / {
+        if ($http_authorization != "Bearer __FIRECRAWL_TOKEN__") {
+            return 401;
+        }
+
+        proxy_pass http://127.0.0.1:__API_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        client_max_body_size 50m;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
