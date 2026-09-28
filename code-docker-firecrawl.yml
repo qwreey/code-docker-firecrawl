@@ -1,0 +1,415 @@
+# code-docker overlay that attaches a self-hosted Firecrawl (scrape/crawl-to-markdown
+# API, https://github.com/firecrawl/firecrawl) as an agent-usable tool. Deliberately no
+# standalone docker-compose.yml here, same shape as code-docker-trilium: running
+# Firecrawl on its own needs nothing this repo adds, so the only thing worth keeping is
+# the wiring that makes it safe to sit next to code-docker.
+#
+# code-docker's own extra-include.yml -> this file, via the EXTRA_INCLUDE chain.
+# `docker compose -f code-docker-firecrawl.yml up` on its own fails: code-docker-internal
+# and code-docker-router are defined only in code-docker's own docker-compose.yml, which
+# has to be part of the same include chain.
+#
+# ## Why this lives outside dind, not inside
+#
+# Firecrawl's whole job is fetching attacker-influenced URLs, including redirects it
+# follows itself - that is a fetcher with a mandate to go wherever a scrape target's
+# response tells it to. webmanager on code-docker:81 has no login of its own, and
+# router-manager/VNC are reachable from code-docker-internal too. A fetcher on that
+# network is one SSRF-style redirect away from the whole admin surface. So Firecrawl's
+# actual fetchers (api, playwright-service) get their OWN `internal: true` network with
+# no route to code-docker-internal at all - not a dind sub-network (dind's containers all
+# share one daemon and one bridge; there is no cheap way to carve "these two containers
+# get egress, these three don't" inside it), and not code-docker-internal with a firewall
+# rule bolted on (this project's whole convention is a network-shaped boundary you can
+# read from `docker network inspect`, not an iptables rule you have to go find).
+#
+# ## The shape
+#
+#            code-docker-internal                    firecrawl (internal: true)
+#      code-docker ---> firecrawl-front:3002  --->  api, playwright-service (routed)
+#           (agent)     (Bearer token gate)          redis, rabbitmq, nuq-postgres (not)
+#                              |                            |            |
+#                              +----------- firecrawl-dns ---+            |
+#                                        (127.0.0.11 + router,             |
+#                                         strict-order dnsmasq)            |
+#                                              |                          |
+#                                     code-docker-router  <---------------+
+#                                     (also joins this network - is the egress gateway
+#                                      AND the second DNS upstream)
+#
+# - `firecrawl` network: internal:true, carries every Firecrawl service plus
+#   code-docker-router (merged in below, same pattern roblox-studio-docker uses for its
+#   own VNC-isolation network).
+# - Only `api` and `playwright-service` carry the `netinit.provider` label, so only they
+#   get a default route planted by code-docker-netinit-docker. `redis`/`rabbitmq`/
+#   `nuq-postgres` get no label and therefore no route at all - not even a DNS-resolvable
+#   path out, since their only nameserver is Docker's own 127.0.0.11 (same-network names
+#   only).
+# - `firecrawl-front` is the only thing on BOTH networks. It is a plain reverse proxy,
+#   not a fetcher - it forwards exactly one path, to `api:3002`, gated on a bearer token.
+#   That token is the only thing standing between "any container on code-docker-internal"
+#   (dind, code-docker-chrome, anything a user runs inside dind) and Firecrawl's API,
+#   because Firecrawl's own self-host build has no key check of its own to fall back on.
+# - `firecrawl-dns` solves a problem specific to this network: `api`/`playwright-service`
+#   need to resolve BOTH same-network compose names (redis, rabbitmq, nuq-postgres) AND
+#   arbitrary external hostnames (whatever URL a scrape job is given) - and Docker's
+#   embedded 127.0.0.11 answers anything outside its own network with an immediate,
+#   definitive SERVFAIL that Node's own resolver (what both `api` and `playwright-service`
+#   run) does NOT retry past. See docker/dns-forwarder/entrypoint.sh for the long version;
+#   this is the same bug code-docker itself (dns-local), roblox-studio-docker and
+#   code-docker-dind all hit independently against router - see code-docker's own
+#   CLAUDE.md "netshare" section. The difference here is that api/playwright-service are
+#   upstream Firecrawl images, not code-docker-built ones with supervisord to hang a
+#   dns-local program off of - so instead of a per-container resolver, one shared
+#   forwarder sits on the network with a static IP, and the two fetchers point their
+#   compose-level `dns:` at it directly (Compose's `dns:` only accepts IP literals, which
+#   is the reason this network has a hand-picked subnet instead of Docker's usual
+#   auto-assigned one).
+#
+# ## What's deliberately NOT here
+#
+# - Upstream's `extra_hosts: host.docker.internal:host-gateway` on `api` is dropped, not
+#   carried over. That maps a name straight at the network's own bridge gateway IP - which
+#   IS reachable from a container even on an `internal: true` network (internal only
+#   removes the NAT/forwarding path to the wider world, not the host's own bridge
+#   interface) - handing a URL-fetching service a live route to the Docker host itself.
+#   Nothing in this stack needs it.
+# - Upstream's experimental `foundationdb`/`foundationdb-init` services (NUQ_BACKEND=fdb)
+#   are skipped - nuq-postgres is the default backend and the one actually exercised here.
+# - No `ROUTER_VHOST_*`/PWA wiring, unlike code-docker-trilium. Nothing here is meant to
+#   be opened by a person; the only consumer is the agent inside code-docker, over
+#   FIRECRAWL_API_URL/FIRECRAWL_TOKEN (merged into the code-docker service below, same
+#   as roblox-studio-docker merges MCP_TOKEN and code-docker-chrome merges
+#   CHROME_CDP_TOKEN).
+
+services:
+  # ---- The two fetchers: the only services that get egress ----
+
+  firecrawl-api:
+    # firecrawl/firecrawl publishes a new semver-tagged image on effectively every merge
+    # to main - there is no separate "cut a GitHub Release" step the way TriliumNext does,
+    # so unlike code-docker-trilium's TRILIUM_IMAGE_TAG this can't be pinned to a release
+    # changelog entry. 2.11.408 was the newest real (non-`latest`, non `-production`-alias)
+    # tag on ghcr.io as of 2026-09-28, and its digest was identical to `latest` at that
+    # moment - it is still a real, reproducible tag rather than a floating one, just one
+    # you should expect to bump by hand more often than trilium's.
+    image: "ghcr.io/firecrawl/firecrawl:${FIRECRAWL_TAG:-2.11.408}"
+    container_name: "${PREFIX:-}code-docker-firecrawl-api"
+    restart: unless-stopped
+    # See docker/wait-for-route.sh - waits for code-docker-netinit-docker's route before
+    # exec'ing the image's own entrypoint with its normal CMD preserved. Without this,
+    # the harness races the (necessarily-after-start) route plant on every fresh
+    # container and can crash-loop - measured live for playwright-service below, and
+    # applied here too on the same reasoning even though api's own startup didn't
+    # happen to need egress immediately in that test.
+    entrypoint: ["/bin/sh", "/firecrawl-wait/wait-for-route.sh"]
+    command: ["node", "dist/src/harness.js", "--start-docker"]
+    # Opt in to code-docker-netinit-docker - this is the only thing that gives this
+    # container a default route at all (see the `firecrawl` network's netinit.gateway
+    # label below). No route in, no route out: this container never gets a second
+    # network, so losing this label just means scrape/crawl jobs fail closed instead of
+    # silently reaching nowhere.
+    labels:
+      netinit.provider: "${PREFIX:-}code-docker-netinit-docker"
+    # Only nameserver this container is allowed to use - see firecrawl-dns below and
+    # docker/dns-forwarder/entrypoint.sh for why a plain resolv.conf line doesn't work.
+    dns:
+      - "${FIRECRAWL_DNS_IP:-10.89.42.2}"
+    volumes:
+      - "./docker/wait-for-route.sh:/firecrawl-wait/wait-for-route.sh:ro"
+    environment:
+      FIRECRAWL_NETINIT_WAIT_TIMEOUT: "${FIRECRAWL_NETINIT_WAIT_TIMEOUT:-60}"
+      HOST: "0.0.0.0"
+      PORT: "3002"
+      ENV: local
+      REDIS_URL: "redis://redis:6379"
+      REDIS_RATE_LIMIT_URL: "redis://redis:6379"
+      PLAYWRIGHT_MICROSERVICE_URL: "http://playwright-service:3000/scrape"
+      NUQ_RABBITMQ_URL: "amqp://rabbitmq:5672"
+      POSTGRES_USER: "${FIRECRAWL_POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${FIRECRAWL_POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${FIRECRAWL_POSTGRES_DB:-postgres}"
+      POSTGRES_HOST: "nuq-postgres"
+      POSTGRES_PORT: "5432"
+      # Firecrawl's own key check (USE_DB_AUTHENTICATION -> Supabase) stays off - self-
+      # host has nothing to check against without wiring up Supabase, and it is not this
+      # setup's auth boundary anyway. firecrawl-front's bearer token is.
+      USE_DB_AUTHENTICATION: "false"
+      NUM_WORKERS_PER_QUEUE: "${FIRECRAWL_NUM_WORKERS:-8}"
+      CRAWL_CONCURRENT_REQUESTS: "${FIRECRAWL_CRAWL_CONCURRENT_REQUESTS:-10}"
+      MAX_CONCURRENT_JOBS: "${FIRECRAWL_MAX_CONCURRENT_JOBS:-5}"
+      BROWSER_POOL_SIZE: "${FIRECRAWL_BROWSER_POOL_SIZE:-5}"
+      # Optional: only needed for the LLM-backed /extract endpoint. Blank means that
+      # endpoint 400s; scrape/crawl/map are unaffected. Sourced from code-docker's own
+      # .env like everything else here - ootb.sh asks for it once (see ootb-manifest.env)
+      # and never overwrites an answer you already gave.
+      OPENAI_API_KEY: "${FIRECRAWL_OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${FIRECRAWL_OPENAI_BASE_URL:-}"
+      MODEL_NAME: "${FIRECRAWL_MODEL_NAME:-}"
+    # From upstream's x-common-service anchor - Firecrawl's own compose file raises this
+    # for every service built off that anchor (api being the only one that uses it).
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - no-new-privileges:true
+    # Resource-exhaustion guard, same "0 sentinel = unlimited" idiom code-docker's own
+    # docker-compose.yml uses for CODE_CPU_LIMIT/CODE_MEM_LIMIT - upstream hardcodes
+    # cpus: 4.0 / mem_limit: 8G here, this just makes that a default instead.
+    deploy:
+      resources:
+        limits:
+          cpus: "${FIRECRAWL_API_CPU_LIMIT:-4}"
+          memory: "${FIRECRAWL_API_MEM_LIMIT:-8g}"
+    depends_on:
+      redis:
+        condition: service_started
+      playwright-service:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_healthy
+    networks:
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  playwright-service:
+    # No versioned tag published upstream at all (ghcr.io/firecrawl/playwright-service
+    # only ever carries `latest`/`linux-amd64`/`linux-arm64` - checked 2026-09-28) - so
+    # unlike firecrawl-api there is no real tag to pin to. Bump means re-pulling `latest`
+    # and accepting whatever shipped; there is no changelog to check first.
+    image: "ghcr.io/firecrawl/playwright-service:${FIRECRAWL_PLAYWRIGHT_TAG:-latest}"
+    container_name: "${PREFIX:-}code-docker-firecrawl-playwright"
+    restart: unless-stopped
+    # See docker/wait-for-route.sh. Not optional here, unlike firecrawl-api's more
+    # defensive use of the same wrapper: `pnpm start` goes through a corepack shim that
+    # fetches its pinned package manager from the npm registry on first run, on every
+    # fresh container - measured live (2026-09-28) crash-looping on ENETUNREACH/EAI_AGAIN
+    # across 15+ restart attempts without this wait, because code-docker-netinit-docker
+    # necessarily plants the route *after* this container has already started.
+    entrypoint: ["/bin/sh", "/firecrawl-wait/wait-for-route.sh"]
+    command: ["pnpm", "start"]
+    labels:
+      netinit.provider: "${PREFIX:-}code-docker-netinit-docker"
+    dns:
+      - "${FIRECRAWL_DNS_IP:-10.89.42.2}"
+    volumes:
+      - "./docker/wait-for-route.sh:/firecrawl-wait/wait-for-route.sh:ro"
+    environment:
+      FIRECRAWL_NETINIT_WAIT_TIMEOUT: "${FIRECRAWL_NETINIT_WAIT_TIMEOUT:-60}"
+      PORT: "3000"
+      ALLOW_LOCAL_WEBHOOKS: "${FIRECRAWL_ALLOW_LOCAL_WEBHOOKS:-}"
+      BLOCK_MEDIA: "${FIRECRAWL_BLOCK_MEDIA:-}"
+      MAX_CONCURRENT_PAGES: "${FIRECRAWL_CRAWL_CONCURRENT_REQUESTS:-10}"
+    # Upstream's own hardening on this exact service - kept as-is, just env-configurable
+    # limits instead of hardcoded ones.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+    deploy:
+      resources:
+        limits:
+          cpus: "${FIRECRAWL_PLAYWRIGHT_CPU_LIMIT:-2}"
+          memory: "${FIRECRAWL_PLAYWRIGHT_MEM_LIMIT:-4g}"
+    networks:
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---- Backing services: no netinit label, so no route out at all ----
+
+  redis:
+    image: "redis:alpine"
+    container_name: "${PREFIX:-}code-docker-firecrawl-redis"
+    restart: unless-stopped
+    command: redis-server --bind 0.0.0.0
+    networks:
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  rabbitmq:
+    image: "rabbitmq:3-management"
+    container_name: "${PREFIX:-}code-docker-firecrawl-rabbitmq"
+    restart: unless-stopped
+    command: rabbitmq-server
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  nuq-postgres:
+    image: "ghcr.io/firecrawl/nuq-postgres:${FIRECRAWL_NUQ_POSTGRES_TAG:-latest}"
+    container_name: "${PREFIX:-}code-docker-firecrawl-postgres"
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${FIRECRAWL_POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${FIRECRAWL_POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${FIRECRAWL_POSTGRES_DB:-postgres}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${FIRECRAWL_POSTGRES_USER:-postgres} -d ${FIRECRAWL_POSTGRES_DB:-postgres}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    volumes:
+      # Named, not a ./data bind mount - the nuq queue's own durability, kept out of
+      # this repo's directory the same reason code-docker-trilium's README recommends
+      # an absolute TRILIUM_VOLUME: builds/ is the kind of place people `rm -rf` while
+      # cleaning up a checkout.
+      - "firecrawl-postgres-data:/var/lib/postgresql/data"
+    networks:
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---- The DNS forwarder every service on `firecrawl` needs ----
+
+  firecrawl-dns:
+    build:
+      context: ./docker/dns-forwarder
+    container_name: "${PREFIX:-}code-docker-firecrawl-dns"
+    restart: unless-stopped
+    environment:
+      # The alias code-docker-router answers to on THIS network - set below, kept in
+      # sync with ROUTER_HOSTNAME the same way code-docker's own dns-local does.
+      ROUTER_HOSTNAME: "${ROUTER_HOSTNAME:-router}"
+    # No netinit.provider label - this container needs no default route of its own. It
+    # only ever talks to two things: 127.0.0.11 (this network's own embedded DNS) and
+    # router, both directly reachable as network peers without leaving `firecrawl` at
+    # all. It is the one component here that legitimately never needs egress.
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      firecrawl:
+        ipv4_address: "${FIRECRAWL_DNS_IP:-10.89.42.2}"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---- The one bridge between the two networks ----
+
+  firecrawl-front:
+    # nginx-unprivileged, not plain nginx: it never needs to bind <1024 or drop from root
+    # to a `nginx` user at startup, so `cap_drop: ALL` below actually holds - plain
+    # nginx:alpine's master process needs CAP_SETUID/CAP_SETGID to fork workers as the
+    # unprivileged `nginx` user, which cap_drop: ALL would break.
+    image: "nginxinc/nginx-unprivileged:1.27-alpine"
+    container_name: "${PREFIX:-}code-docker-firecrawl-front"
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/firecrawl-front/entrypoint.sh"]
+    environment:
+      # Bearer token gate - see docker/firecrawl-proxy/entrypoint.sh. Empty means every
+      # request 401s, not every request through: there is no "auth off" mode here.
+      FIRECRAWL_TOKEN: "${FIRECRAWL_TOKEN:-}"
+    volumes:
+      - "./docker/firecrawl-proxy:/firecrawl-front:ro"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      # Reachable from code-docker (and anything else on code-docker-internal) at
+      # http://firecrawl:3002 - gated by the bearer token, since reachability alone
+      # isn't a boundary on that shared network (see code-docker-chrome's own
+      # CLAUDE.md for the same reasoning about its CDP token).
+      code-docker-internal:
+        aliases:
+          - firecrawl
+      firecrawl: {}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---- Field merges into services this file does not define ----
+
+  # Hands the token + URL to the actual consumer. code-docker has no idea this project
+  # exists (that's the point of EXTRA_INCLUDE), so without this merge both variables
+  # would be empty inside the agent's environment - same shape as roblox-studio-docker's
+  # MCP_TOKEN merge and code-docker-chrome's CHROME_CDP_TOKEN merge.
+  code-docker:
+    environment:
+      FIRECRAWL_API_URL: "http://firecrawl:3002"
+      FIRECRAWL_TOKEN: "${FIRECRAWL_TOKEN:-}"
+
+  # router has to join `firecrawl` itself for two reasons: it is the network's declared
+  # netinit.gateway (a container's default route can only point at a container that is
+  # actually present on the same L2 segment), and firecrawl-dns resolves it by the alias
+  # below as its second DNS upstream. Field merge into a service this file does not
+  # define - include merging is by service name, already relied on by
+  # code-docker-trilium/roblox-studio-docker/code-docker-chrome the same way.
+  code-docker-router:
+    networks:
+      firecrawl:
+        aliases:
+          - "${ROUTER_HOSTNAME:-router}"
+
+networks:
+  # Hand-picked subnet, not Docker's usual auto-assigned one - required because
+  # Compose's per-service `dns:` field only accepts IP literals (no hostname lookup,
+  # obviously), so firecrawl-dns needs a stable, known-in-advance address for
+  # firecrawl-api/playwright-service to point at. 10.89.42.0/24 was chosen to sit well
+  # outside the 172.17-172.3x range Docker auto-assigns its own bridges from (checked
+  # against this deployment's existing networks with `docker network inspect`) - override
+  # FIRECRAWL_SUBNET/FIRECRAWL_DNS_IP together if it collides with something else on your
+  # host.
+  firecrawl:
+    name: "${PREFIX:-}code-docker-firecrawl"
+    internal: true
+    ipam:
+      config:
+        - subnet: "${FIRECRAWL_SUBNET:-10.89.42.0/24}"
+          # Docker's own auto-assignment for everything WITHOUT a pinned
+          # `ipv4_address:` (every service here except firecrawl-dns) starts from the
+          # bottom of the subnet and hands addresses out in container-start order - so
+          # without this, whichever container happens to start first can grab
+          # FIRECRAWL_DNS_IP before firecrawl-dns itself does (measured: rabbitmq won
+          # that race once during testing, and firecrawl-dns then failed to start at all
+          # with "Address already in use"). Restricting the auto-assign pool to the top
+          # half of the subnet reserves .2-.127 for static addresses regardless of start
+          # order - only firecrawl-dns uses one today, but this leaves room without
+          # having to touch this range again.
+          ip_range: "${FIRECRAWL_SUBNET_AUTO_RANGE:-10.89.42.128/25}"
+    labels:
+      netinit.provider: "${PREFIX:-}code-docker-netinit-docker"
+      netinit.gateway: "${PREFIX:-}code-docker-router"
+      netinit.exempt-forward: "true"
+
+volumes:
+  firecrawl-postgres-data:
+    name: "${PREFIX:-}code-docker-firecrawl-postgres-data"
