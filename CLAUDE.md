@@ -93,9 +93,9 @@ glibc/node build matches what was actually compiled/tested against.
 `apps/playwright-service-ts` and `apps/nuq-postgres` are each fetched as their own
 `FROM scratch` stage via `ADD https://github.com/firecrawl/firecrawl.git#${FIRECRAWL_REF}:
 <subdir> /` - the same git-context mechanism code-docker's own root Dockerfile uses for
-router-docker-client subdirectories, except pinned to a real tag instead of a floating
-`#main` ref (Firecrawl publishes no separate "stable" branch to float against - see "Open
-questions" below on what that tag actually means upstream).
+router-docker-client subdirectories (Firecrawl publishes no separate "stable" branch, so
+a tag is the only reproducible anchor - see "Open questions" below on what that tag
+actually means upstream).
 
 Each app's own Dockerfile build recipe is reproduced as closely as possible in its own
 stage (`go-build` for the Go html-to-markdown shared library, `api-build`, `playwright-

@@ -5,9 +5,8 @@
 # only orients the stage list below.
 #
 # Every `apps/<x>` upstream source directory is fetched directly as its own build context,
-# pinned to a real git tag (not `main`) - unlike router-docker-client's floating `#main`
-# fetches elsewhere in code-docker, Firecrawl publishes no separate "stable" branch, so a
-# tag is the only reproducible anchor. `ADD <git-url>#<ref>:<subdir> /` is the same
+# pinned to a real git tag (not `main`): Firecrawl publishes no separate "stable" branch,
+# so a tag is the only reproducible anchor. `ADD <git-url>#<ref>:<subdir> /` is the same
 # mechanism code-docker's own root Dockerfile uses for router-docker-client subdirectories -
 # see that file's own comment on the `netshare`/`dns-local` stages. Each upstream app
 # directory becomes its own `FROM scratch` stage so a BuildKit named context of the same
@@ -30,14 +29,14 @@ ADD https://github.com/firecrawl/firecrawl.git#${FIRECRAWL_REF}:apps/nuq-postgre
 # dns-local is what gives this container working DNS for the two fetchers (api,
 # playwright-service) while it sits on an `internal: true` network behind router - same
 # mechanism and same reason code-docker-chrome carries it. Fetched, not vendored, for the
-# same reason as there: it isn't specific to this project. Floating #main is deliberate
-# here too (see router-docker-client's own CLAUDE.md) - code-docker's own CLAUDE.md notes
-# the one gotcha (Docker caches this fetch; rebuild --no-cache if an upstream fix doesn't
-# seem to land).
+# same reason as there: it isn't specific to this project. Pinned to that repo's release
+# tag (see its own CLAUDE.md); code-docker's dev-bump-router-client.sh moves this default.
 FROM scratch AS dns-local
-ADD https://github.com/qwreey/router-docker-client.git#main:dns-local /
+ARG ROUTER_CLIENT_REF=v0.1.0
+ADD https://github.com/qwreey/router-docker-client.git#${ROUTER_CLIENT_REF}:dns-local /
 FROM scratch AS netshare
-ADD https://github.com/qwreey/router-docker-client.git#main:netshare /
+ARG ROUTER_CLIENT_REF=v0.1.0
+ADD https://github.com/qwreey/router-docker-client.git#${ROUTER_CLIENT_REF}:netshare /
 
 # ---- Go shared library (apps/api/sharedLibs/go-html-to-md) ----
 # Reproduces apps/api/Dockerfile's `go-build` stage exactly.
