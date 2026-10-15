@@ -32,10 +32,10 @@ ADD https://github.com/firecrawl/firecrawl.git#${FIRECRAWL_REF}:apps/nuq-postgre
 # same reason as there: it isn't specific to this project. Pinned to that repo's release
 # tag (see its own CLAUDE.md); code-docker's dev-bump-router-client.sh moves this default.
 FROM scratch AS dns-local
-ARG ROUTER_CLIENT_REF=v0.1.0
+ARG ROUTER_CLIENT_REF=v0.1.1
 ADD https://github.com/qwreey/router-docker-client.git#${ROUTER_CLIENT_REF}:dns-local /
 FROM scratch AS netshare
-ARG ROUTER_CLIENT_REF=v0.1.0
+ARG ROUTER_CLIENT_REF=v0.1.1
 ADD https://github.com/qwreey/router-docker-client.git#${ROUTER_CLIENT_REF}:netshare /
 
 # ---- Go shared library (apps/api/sharedLibs/go-html-to-md) ----
